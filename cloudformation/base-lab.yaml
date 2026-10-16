@@ -344,10 +344,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${EnvironmentName}-lab-instance-sg'
-      GroupDescription: >
-        Security Group para instancias EC2 de laboratorio.
-        SSH/RDP solo desde IP conocida. Outbound libre para instalar paquetes.
-        IMPORTANTE: No abrir 0.0.0.0/0 en produccion.
+      GroupDescription: SG para instancias EC2 de laboratorio SAP-C02
       VpcId: !Ref VPC
       SecurityGroupIngress:
         # Sin reglas de entrada por defecto - agregar segun lab
@@ -369,10 +366,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${EnvironmentName}-database-sg'
-      GroupDescription: >
-        Security Group para bases de datos RDS/Aurora.
-        Solo acepta conexiones desde LabInstanceSecurityGroup.
-        Patron SAP-C02: nunca exponer DB directamente a internet.
+      GroupDescription: SG para bases de datos RDS y Aurora del laboratorio SAP-C02
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -398,10 +392,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${EnvironmentName}-alb-sg'
-      GroupDescription: >
-        Security Group para Application Load Balancer.
-        Acepta HTTP/HTTPS desde internet. Patron tipico SAP-C02:
-        ALB publico -> Target Group en subnets privadas.
+      GroupDescription: SG para Application Load Balancer del laboratorio SAP-C02
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
