@@ -1,0 +1,724 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAP-C02 Base Lab Environment - Entorno base para practicar AWS Certified
+  Solutions Architect Professional. Incluye VPC multi-AZ, subnets publicas
+  y privadas, IGW, NAT Gateway, route tables, security groups base, y roles
+  IAM para laboratorios. Cuenta: 274591448709 | Region: us-east-1
+
+# ===========================================================================
+# METADATA
+# ===========================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configuracion de Red"
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: "Configuracion del Laboratorio"
+        Parameters:
+          - EnvironmentName
+          - EnableNatGateway
+          - EnableVpcFlowLogs
+    ParameterLabels:
+      VpcCidr:
+        default: "CIDR de la VPC"
+      EnableNatGateway:
+        default: "Habilitar NAT Gateway (genera costos)"
+      EnableVpcFlowLogs:
+        default: "Habilitar VPC Flow Logs"
+
+# ===========================================================================
+# PARAMETROS
+# ===========================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: sap-c02-lab
+    Description: >
+      Prefijo para nombrar todos los recursos. Cambiarlo permite tener
+      multiples entornos en paralelo (ej: sap-c02-lab-week1).
+    AllowedPattern: '[a-z0-9\-]+'
+    ConstraintDescription: Solo letras minusculas, numeros y guiones.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: >
+      CIDR block de la VPC. /16 da 65,536 IPs, suficiente para todos los labs.
+      Rango privado RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: "Subnet publica AZ1 (us-east-1a) - 256 IPs, 251 utilizables"
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: "Subnet publica AZ2 (us-east-1b) - 256 IPs, 251 utilizables"
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.10.0/24
+    Description: "Subnet privada AZ1 (us-east-1a) - Para EC2, RDS, Lambda en VPC"
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+    Description: "Subnet privada AZ2 (us-east-1b) - Para EC2, RDS, Lambda en VPC"
+
+  EnableNatGateway:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      NAT Gateway cuesta ~$0.045/hora + transferencia de datos.
+      CONSEJO: Activar solo cuando el lab lo requiera. Destruir el stack
+      o cambiar a false cuando no se use para evitar costos innecesarios.
+      Para salida a internet desde subnets privadas, alternativa gratuita:
+      usar instancia EC2 como NAT (menos confiable, solo para labs).
+
+  EnableVpcFlowLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      VPC Flow Logs captura trafico de red. Util para practicar seguridad
+      y troubleshooting (tema SAP-C02 Dominio 1). Almacena en CloudWatch
+      Logs. Costo minimo pero existe. Desactivar si el presupuesto es ajustado.
+
+# ===========================================================================
+# CONDITIONS
+# ===========================================================================
+Conditions:
+
+  CreateNatGateway: !Equals [!Ref EnableNatGateway, 'true']
+  CreateVpcFlowLogs: !Equals [!Ref EnableVpcFlowLogs, 'true']
+
+# ===========================================================================
+# RESOURCES
+# ===========================================================================
+Resources:
+
+  # =========================================================================
+  # VPC
+  # SAP-C02 relevancia: Dominio 1 (Organizational Complexity) - Networking
+  # =========================================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true  # Permite nombres DNS para instancias EC2
+      EnableDnsSupport: true    # Requerido para resolver nombres DNS en VPC
+      InstanceTenancy: default  # Shared tenancy (dedicated cuesta ~10x mas)
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: SAP-C02-Lab
+
+  # =========================================================================
+  # INTERNET GATEWAY
+  # Permite trafico IPv4/IPv6 entre VPC e internet publico.
+  # Sin IGW, las subnets "publicas" no pueden alcanzar internet.
+  # =========================================================================
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # =========================================================================
+  # SUBNETS PUBLICAS
+  # MapPublicIpOnLaunch: true -> EC2 recibe IP publica automaticamente.
+  # Las subnets "publicas" tienen ruta al IGW en su route table.
+  # =========================================================================
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']  # AZ1: us-east-1a
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet-1a'
+        - Key: Type
+          Value: Public
+        - Key: AZ
+          Value: !Select [0, !GetAZs '']
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']  # AZ2: us-east-1b
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet-1b'
+        - Key: Type
+          Value: Public
+        - Key: AZ
+          Value: !Select [1, !GetAZs '']
+
+  # =========================================================================
+  # SUBNETS PRIVADAS
+  # Sin ruta al IGW. Para acceso a internet requieren NAT Gateway (costoso)
+  # o VPC Endpoints (recomendado para servicios AWS).
+  # =========================================================================
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']  # AZ1: us-east-1a
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-1a'
+        - Key: Type
+          Value: Private
+        - Key: AZ
+          Value: !Select [0, !GetAZs '']
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']  # AZ2: us-east-1b
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-1b'
+        - Key: Type
+          Value: Private
+        - Key: AZ
+          Value: !Select [1, !GetAZs '']
+
+  # =========================================================================
+  # NAT GATEWAY (condicional)
+  # Permite que subnets PRIVADAS accedan a internet de forma saliente.
+  # Requiere Elastic IP. Costo: ~$32/mes si corre 24/7.
+  # SAP-C02: NAT Gateway vs NAT Instance vs VPC Endpoints es tema de examen.
+  # =========================================================================
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Condition: CreateNatGateway
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1  # NAT Gateway siempre va en subnet PUBLICA
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-gw'
+
+  # =========================================================================
+  # ROUTE TABLES
+  # Cada subnet debe estar asociada a una route table.
+  # Public RT: ruta 0.0.0.0/0 -> IGW
+  # Private RT: ruta 0.0.0.0/0 -> NAT GW (si existe) o sin ruta a internet
+  # =========================================================================
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt-1a'
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Condition: CreateNatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt-1b'
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Condition: CreateNatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # =========================================================================
+  # SECURITY GROUPS
+  # Los SG son stateful (permite retorno automatico del trafico).
+  # Diferencia SAP-C02: SG (instancia, stateful) vs NACL (subnet, stateless).
+  # =========================================================================
+
+  # SG para instancias EC2 de laboratorio con acceso SSH/RDP controlado
+  LabInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-lab-instance-sg'
+      GroupDescription: >
+        Security Group para instancias EC2 de laboratorio.
+        SSH/RDP solo desde IP conocida. Outbound libre para instalar paquetes.
+        IMPORTANTE: No abrir 0.0.0.0/0 en produccion.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Sin reglas de entrada por defecto - agregar segun lab
+        # Ejemplo para agregar SSH desde tu IP:
+        # aws ec2 authorize-security-group-ingress \
+        #   --group-id <sg-id> --protocol tcp --port 22 \
+        #   --cidr $(curl -s ifconfig.me)/32
+        []
+      SecurityGroupEgress:
+        - IpProtocol: -1       # Todo protocolo
+          CidrIp: 0.0.0.0/0   # Todo destino
+          Description: "Salida libre para acceso a internet y servicios AWS"
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-lab-instance-sg'
+
+  # SG para RDS/Aurora en subnets privadas
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-database-sg'
+      GroupDescription: >
+        Security Group para bases de datos RDS/Aurora.
+        Solo acepta conexiones desde LabInstanceSecurityGroup.
+        Patron SAP-C02: nunca exponer DB directamente a internet.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306      # MySQL/Aurora MySQL
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LabInstanceSecurityGroup
+          Description: "MySQL/Aurora desde instancias de laboratorio"
+        - IpProtocol: tcp
+          FromPort: 5432      # PostgreSQL/Aurora PostgreSQL
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LabInstanceSecurityGroup
+          Description: "PostgreSQL desde instancias de laboratorio"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Salida para actualizaciones y replicacion"
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-database-sg'
+
+  # SG para Application Load Balancer
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-alb-sg'
+      GroupDescription: >
+        Security Group para Application Load Balancer.
+        Acepta HTTP/HTTPS desde internet. Patron tipico SAP-C02:
+        ALB publico -> Target Group en subnets privadas.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "HTTP publico"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS publico"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Salida hacia target groups"
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-alb-sg'
+
+  # =========================================================================
+  # IAM ROLES PARA LABORATORIOS
+  # SAP-C02 relevancia: Principio de minimo privilegio, roles vs usuarios IAM,
+  # cross-account access, instance profiles.
+  # =========================================================================
+
+  # Rol para instancias EC2 - acceso a servicios AWS comunes en labs
+  EC2LabRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ec2-lab-role'
+      Description: >
+        Rol IAM para instancias EC2 de laboratorio SAP-C02.
+        Incluye acceso a SSM (Session Manager como alternativa a SSH),
+        S3 para transferencia de archivos, y CloudWatch para logs.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com   # Solo EC2 puede asumir este rol
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM Session Manager: acceso seguro sin necesidad de puertos SSH abiertos
+        # Concepto SAP-C02: alternativa a bastiones, mas seguro, auditado
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # CloudWatch Agent: envio de metricas y logs del sistema operativo
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-ec2-lab-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3: leer/escribir en bucket de lab (se creara en labs especificos)
+              - Sid: S3LabAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${EnvironmentName}-*'
+                  - !Sub 'arn:aws:s3:::${EnvironmentName}-*/*'
+              # Describe instancias propias (metadata, troubleshooting)
+              - Sid: EC2Describe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ec2-lab-role'
+
+  # Instance Profile: necesario para asociar el IAM Role a una instancia EC2
+  EC2LabInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${EnvironmentName}-ec2-lab-profile'
+      Roles:
+        - !Ref EC2LabRole
+
+  # Rol para Lambda en labs de arquitecturas serverless
+  LambdaLabRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-lambda-lab-role'
+      Description: >
+        Rol IAM para funciones Lambda de laboratorio SAP-C02.
+        VPC execution + acceso a DynamoDB, SQS, SNS para labs de
+        arquitecturas event-driven y serverless.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Permite a Lambda ejecutarse dentro de la VPC (crear ENI en subnets privadas)
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-lambda-lab-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB: patron serverless comun en SAP-C02
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${EnvironmentName}-*'
+              # SQS: desacoplamiento, patron productor-consumidor
+              - Sid: SQSAccess
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${EnvironmentName}-*'
+              # SNS: notificaciones y fan-out
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${EnvironmentName}-*'
+              # S3: lectura/escritura en bucket de lab
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${EnvironmentName}-*'
+                  - !Sub 'arn:aws:s3:::${EnvironmentName}-*/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-lambda-lab-role'
+
+  # =========================================================================
+  # VPC FLOW LOGS (condicional)
+  # Captura informacion de trafico IP hacia/desde ENIs en la VPC.
+  # SAP-C02: seguridad, troubleshooting, compliance (Dominio 1 y 2).
+  # Formato: version, account-id, interface-id, srcaddr, dstaddr, srcport,
+  # dstport, protocol, packets, bytes, start, end, action, log-status
+  # =========================================================================
+
+  FlowLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateVpcFlowLogs
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${EnvironmentName}'
+      RetentionInDays: 7   # 7 dias para lab. Produccion: 90-365 dias
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-flow-logs'
+
+  FlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: CreateVpcFlowLogs
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-flow-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  VPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateVpcFlowLogs
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL         # ACCEPT, REJECT, o ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogsLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-flow-logs'
+
+# ===========================================================================
+# OUTPUTS
+# Los outputs permiten referenciar recursos de este stack desde otros stacks
+# (cross-stack references) usando ImportValue. Patron importante en SAP-C02.
+# ===========================================================================
+Outputs:
+
+  VpcId:
+    Description: "ID de la VPC del laboratorio"
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${EnvironmentName}-VpcId'
+
+  VpcCidr:
+    Description: "CIDR block de la VPC"
+    Value: !GetAtt VPC.CidrBlock
+    Export:
+      Name: !Sub '${EnvironmentName}-VpcCidr'
+
+  PublicSubnet1Id:
+    Description: "ID de la subnet publica en AZ1 (us-east-1a)"
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${EnvironmentName}-PublicSubnet1Id'
+
+  PublicSubnet2Id:
+    Description: "ID de la subnet publica en AZ2 (us-east-1b)"
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${EnvironmentName}-PublicSubnet2Id'
+
+  PrivateSubnet1Id:
+    Description: "ID de la subnet privada en AZ1 (us-east-1a)"
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${EnvironmentName}-PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Description: "ID de la subnet privada en AZ2 (us-east-1b)"
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${EnvironmentName}-PrivateSubnet2Id'
+
+  PublicSubnets:
+    Description: "Lista de subnets publicas (util para ALB, bastiones)"
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub '${EnvironmentName}-PublicSubnets'
+
+  PrivateSubnets:
+    Description: "Lista de subnets privadas (util para EC2, RDS, Lambda)"
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${EnvironmentName}-PrivateSubnets'
+
+  LabInstanceSGId:
+    Description: "ID del Security Group para instancias EC2 de laboratorio"
+    Value: !Ref LabInstanceSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-LabInstanceSGId'
+
+  DatabaseSGId:
+    Description: "ID del Security Group para bases de datos"
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-DatabaseSGId'
+
+  LoadBalancerSGId:
+    Description: "ID del Security Group para Application Load Balancer"
+    Value: !Ref LoadBalancerSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-LoadBalancerSGId'
+
+  EC2LabRoleArn:
+    Description: "ARN del IAM Role para instancias EC2 de laboratorio"
+    Value: !GetAtt EC2LabRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-EC2LabRoleArn'
+
+  EC2LabInstanceProfileArn:
+    Description: "ARN del Instance Profile para instancias EC2"
+    Value: !GetAtt EC2LabInstanceProfile.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-EC2LabInstanceProfileArn'
+
+  LambdaLabRoleArn:
+    Description: "ARN del IAM Role para funciones Lambda de laboratorio"
+    Value: !GetAtt LambdaLabRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-LambdaLabRoleArn'
+
+  NatGatewayId:
+    Description: "ID del NAT Gateway (solo si EnableNatGateway=true)"
+    Condition: CreateNatGateway
+    Value: !Ref NatGateway
+    Export:
+      Name: !Sub '${EnvironmentName}-NatGatewayId'
+
+  StackRegion:
+    Description: "Region donde fue desplegado el stack"
+    Value: !Ref AWS::Region
+
+  StackAccount:
+    Description: "ID de la cuenta AWS"
+    Value: !Ref AWS::AccountId
+
+  DeployCommand:
+    Description: "Comando para desplegar este stack con AWS CLI"
+    Value: !Sub >
+      aws cloudformation deploy
+      --template-file cloudformation/base-lab.yaml
+      --stack-name ${EnvironmentName}
+      --capabilities CAPABILITY_NAMED_IAM
+      --parameter-overrides EnableNatGateway=false EnableVpcFlowLogs=true
+      --region us-east-1
